@@ -35,6 +35,18 @@ def wechat_read_chat(contact: str, limit: int = 50, days: int = 7) -> str:
 
 
 @mcp.tool()
+def wechat_read_chat_range(contact: str, start: str, end: str = "", limit: int = 200, offset: int = 0) -> str:
+    """按日期区间读取指定群或联系人的消息,按时间正序分页。start/end=YYYY-MM-DD(本地时间,含首尾两天),end留空=今天。群聊带发送者名称;返回总数和下一页offset。"""
+    return query._human("range", query.read_chat_range(contact, start, end, limit, offset))
+
+
+@mcp.tool()
+def wechat_search_chat(contact: str, keyword: str, start: str = "", end: str = "", days: int = 30, limit: int = 50) -> str:
+    """只在指定群或联系人内搜索关键词。给 start(YYYY-MM-DD)时按日期区间搜,否则搜最近 days 天;结果从新到旧。"""
+    return query._human("search-chat", query.search_chat(contact, keyword, days, limit, start, end))
+
+
+@mcp.tool()
 def wechat_recent_messages(days: int = 3, limit: int = 100) -> str:
     """最近几天所有对话的消息概览,用于提取待办/行动项。"""
     return query._human("recent", query.recent(days, limit))

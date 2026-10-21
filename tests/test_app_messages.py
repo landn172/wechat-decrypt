@@ -165,6 +165,22 @@ def test_quote_card_keeps_reply_and_quoted_content():
     assert parsed["summary"] == "我同意 [↩ Alice: 明天十点开会]"
 
 
+def test_group_quote_names_the_member_not_the_chatroom():
+    import appmsg
+
+    parsed = appmsg.parse_app_message(
+        _xml(
+            57,
+            "<title>OK</title><refermsg><type>1</type>"
+            "<fromusr>123@chatroom</fromusr><chatusr>wxid_bob</chatusr>"
+            "<displayname>Bob</displayname><content>链接</content></refermsg>",
+        ),
+        _local_type(57),
+    )
+    assert parsed["quoted_sender_wxid"] == "wxid_bob"
+    assert parsed["summary"] == "OK [↩ Bob: 链接]"
+
+
 def test_nested_type_does_not_override_local_type_fallback():
     import appmsg
 

@@ -5,6 +5,8 @@
   list                        列出所有会话
   read <contact> [-n N -d D]  读与某人的聊天
   search <kw> [-d D -n N]     全文搜索
+  range <contact> --start YYYY-MM-DD [--end YYYY-MM-DD -n N --offset O]  按日期区间读某个群/联系人
+  search-chat <contact> <kw> [--start --end | -d D] [-n N]              在某个群/联系人内搜索
   recent [-d D -n N]          最近动态
   summary [-d D]              结构化摘要(待办分析)
   events [-e EVENT -d D -n N] 系统事件（拍一拍/撤回/群事件等）
@@ -16,7 +18,7 @@ import os
 import time
 import json
 import argparse
-from datetime import datetime
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # skill 根
 import config  # noqa: E402
@@ -104,16 +106,49 @@ def list_chat_page(limit: int = 100, offset: int = 0) -> dict:
             'next_offset': following if following < len(chats) else None}
 
 
+def _match_one_chat(contact: str, name2id: dict[str, str]):
+    """Return ((table, wxid, display), None) or (None, error dict)."""
+    matched = contacts.find_contact(contact, name2id)
+    if not matched:
+        return None, {"error": f"未找到匹配 '{contact}' 的联系人", "candidates": []}
+    if len(matched) > 1:
+        return None, {"error": f"匹配 '{contact}' 的联系人不唯一({len(matched)})，请使用具体 wxid 选择",
+                      "candidates": [{"wxid": w, "display": d} for _t, w, d in matched[:10]]}
+    return matched[0], None
+
+
+def _parse_date_range(start: str, end: str = "") -> tuple[int, int]:
+    """Local-time [start 00:00, day after end 00:00); empty end means today."""
+    try:
+        first = datetime.strptime(start, "%Y-%m-%d")
+        last = datetime.strptime(end, "%Y-%m-%d") if end else datetime.now().replace(
+            hour=0, minute=0, second=0, microsecond=0)
+    except (TypeError, ValueError):
+        raise ValueError('start/end must be YYYY-MM-DD dates') from None
+    if first > last:
+        raise ValueError('start must not be after end')
+    return int(first.timestamp()), int((last + timedelta(days=1)).timestamp())
+
+
+def _with_group_sender(msg: dict, row: dict, is_group: bool) -> dict:
+    if not is_group or msg.get("is_system"):
+        return msg
+    sender = row.get("sender_wxid")
+    msg["sender"] = ("我" if sender == db.get_my_wxid() else contacts.resolve_contact_name(sender)) if sender else "未知"
+    prefix = f"{sender}:\n" if sender else ""
+    if prefix and msg["content"].startswith(prefix):
+        msg["content"] = msg["content"][len(prefix):]
+    return msg
+
+
 def read_chat(contact: str, limit: int = 50, days: int = 7) -> dict:
     _validate_window(days, limit)
     name2id = db.get_name2id()
     since = int(time.time()) - days * 86400
-    matched = contacts.find_contact(contact, name2id)
-    if not matched:
-        return {"error": f"未找到匹配 '{contact}' 的联系人", "candidates": []}
-    if len(matched) > 1:
-        return {"error": f"匹配 '{contact}' 的联系人不唯一({len(matched)})，请使用具体 wxid 选择",
-                "candidates": [{"wxid": w, "display": d} for _t, w, d in matched[:10]]}
+    matched, error = _match_one_chat(contact, name2id)
+    if error:
+        return error
+    matched = [matched]
     out = []
     for table, wxid, display in matched:
         msgs = []
@@ -134,11 +169,77 @@ def read_chat(contact: str, limit: int = 50, days: int = 7) -> dict:
     return {"chats": out}
 
 
+def read_chat_range(contact: str, start: str, end: str = "", limit: int = 200, offset: int = 0) -> dict:
+    """One chat's messages in a date range, oldest first, paged by offset."""
+    _validate_window(1, limit)
+    if type(offset) is not int or offset < 0:
+        raise ValueError('offset must be a nonnegative integer')
+    lower, upper = _parse_date_range(start, end)
+    name2id = db.get_name2id()
+    matched, error = _match_one_chat(contact, name2id)
+    if error:
+        return error
+    table, wxid, display = matched
+    window = f"create_time >= {lower} AND create_time < {upper}"
+    total = 0
+    rows = []
+    for shard, (db_path, tabs) in enumerate(_msg_dbs_tables()):
+        if table not in tabs:
+            continue
+        counted = db.query(db_path, f"SELECT count(*) AS n FROM {_quoted_identifier(table)} WHERE {window};")
+        total += int(counted[0]["n"]) if counted else 0
+        for row in db.query(
+                db_path,
+                f"SELECT create_time, local_id, local_type, real_sender_id, "
+                f"hex(message_content) AS message_hex, n.user_name AS sender_wxid "
+                f"FROM {_quoted_identifier(table)} m "
+                f"LEFT JOIN Name2Id n ON n.rowid = m.real_sender_id "
+                f"WHERE {window} ORDER BY create_time ASC, local_id ASC LIMIT {offset + limit};"):
+            rows.append((int(row.get("create_time") or 0), shard, int(row.get("local_id") or 0), row))
+    rows.sort(key=lambda item: item[:3])
+    is_group = wxid.endswith("@chatroom")
+    page = [_with_group_sender(_fmt_msg(row), row, is_group) for *_key, row in rows[offset:offset + limit]]
+    following = offset + len(page)
+    return {"wxid": wxid, "display": display, "is_group": is_group,
+            "start": message.format_time(lower), "end": message.format_time(upper - 1),
+            "total": total, "count": len(page), "offset": offset, "limit": limit,
+            "next_offset": following if following < total else None, "messages": page}
+
+
 def search(keyword: str, days: int = 30, limit: int = 50) -> dict:
     _validate_window(days, limit)
-    name2id = db.get_name2id()
     scan_until = int(time.time())
-    since = scan_until - days * 86400
+    hits = _search(keyword, scan_until - days * 86400 + 1, scan_until + 1, limit)
+    return {"keyword": keyword, "count": len(hits), "messages": hits}
+
+
+def search_chat(contact: str, keyword: str, days: int = 30, limit: int = 50,
+                start: str = "", end: str = "") -> dict:
+    """Keyword search inside one chat, by recent days or by a start/end date range."""
+    if start:
+        _validate_window(1, limit)
+        lower, upper = _parse_date_range(start, end)
+    elif end:
+        raise ValueError('end requires start')
+    else:
+        _validate_window(days, limit)
+        now = int(time.time())
+        lower, upper = now - days * 86400 + 1, now + 1
+    matched, error = _match_one_chat(contact, db.get_name2id())
+    if error:
+        return error
+    table, wxid, display = matched
+    hits = _search(keyword, lower, upper, limit, table=table, is_group=wxid.endswith("@chatroom"))
+    return {"keyword": keyword, "wxid": wxid, "display": display,
+            "start": message.format_time(lower), "end": message.format_time(upper - 1),
+            "count": len(hits), "limit": limit, "messages": hits}
+
+
+def _search(keyword: str, lower: int, upper: int, limit: int,
+            table: str | None = None, is_group: bool = False) -> list[dict]:
+    """Matches with lower <= create_time < upper, newest first; table restricts to one chat."""
+    name2id = db.get_name2id()
+    since, scan_until = lower - 1, upper - 1
     kw = keyword.replace("'", "''")
     kw_hex = keyword.encode("utf-8").hex().upper()
     keyword_folded = keyword.casefold()
@@ -153,13 +254,14 @@ def search(keyword: str, days: int = 30, limit: int = 50) -> dict:
             return False
         seen.add(identity)
         table = row.get("source_table", "")
-        formatted = _fmt_msg(row)
+        formatted = _with_group_sender(_fmt_msg(row), row, is_group)
         formatted["contact"] = contacts.resolve_contact_name(name2id.get(table, table))
         hits.append(formatted)
         return True
 
+    only_table = table
     for db_path, tabs in _msg_dbs_tables():
-        tables = sorted(t for t in tabs if t.startswith("Msg_"))
+        tables = sorted(t for t in tabs if t.startswith("Msg_") and only_table in (None, t))
         for table_batch in _chunks(tables):
             selects = []
             fallback_selects = []
@@ -202,8 +304,7 @@ def search(keyword: str, days: int = 30, limit: int = 50) -> dict:
                     if fallback_matches >= limit:
                         break
     hits.sort(key=lambda x: x["_ts"], reverse=True)
-    hits = hits[:limit]
-    return {"keyword": keyword, "count": len(hits), "messages": hits}
+    return hits[:limit]
 
 
 def recent(days: int = 3, limit: int = 100) -> dict:
@@ -462,6 +563,12 @@ def _fmt_msg(row: dict) -> dict:
     direction = "[未知]" if not sender else "[我]" if sender == db.get_my_wxid() else "[对方]"
     if type_key == "49":
         app = appmsg.parse_app_message(content, row.get("local_type", ""))
+        quoted_wxid = app.get("quoted_sender_wxid")
+        if quoted_wxid:
+            name = "我" if quoted_wxid == db.get_my_wxid() else contacts.resolve_contact_name(quoted_wxid)
+            if name != quoted_wxid or not app["quoted_sender"]:
+                app["quoted_sender"] = name
+            app["summary"] = appmsg.format_app_message(app)
         details = app["summary"].replace("\n", " ")[:500]
         display = f"[{app['label']}]" + (f" {details}" if details else "")
         return {
@@ -506,6 +613,23 @@ def _human(cmd: str, r) -> str:
             for m in chat["messages"]:
                 out.append(f"  [{m['time']}] {m['direction']} " + (m["content"] if m["is_text"] else f"[{m['type']}]"))
         return "\n".join(out) or "未找到消息"
+    if cmd == "range":
+        kind = "群聊" if r["is_group"] else "对话"
+        out = [f"=== {kind} {r['display']}：{r['start']} ~ {r['end']}，共 {r['total']} 条，"
+               f"本页第 {r['offset'] + 1}-{r['offset'] + r['count']} 条 ==="]
+        for m in r["messages"]:
+            who = m.get("sender") or m["direction"]
+            out.append(f"  [{m['time']}] {who}: " + (m["content"] if m["is_text"] else f"[{m['type']}]"))
+        if r["next_offset"] is not None:
+            out.append(f"未读完：下一页 offset={r['next_offset']}，limit={r['limit']}")
+        return "\n".join(out)
+    if cmd == "search-chat":
+        out = [f"在 {r['display']} 中搜索 '{r['keyword']}'（{r['start']} ~ {r['end']}）找到 {r['count']} 条"
+               + ("，已达 limit，可能还有更早的结果" if r["count"] >= r["limit"] else "") + ":"]
+        for m in r["messages"]:
+            who = m.get("sender") or m["direction"]
+            out.append(f"  [{m['time']}] {who}: " + (m["content"] if m["is_text"] else f"[{m['type']}]"))
+        return "\n".join(out)
     if cmd == "search":
         out = [f"搜索 '{r['keyword']}' 找到 {r['count']} 条:\n"]
         for m in r["messages"]:
@@ -563,6 +687,8 @@ def main():
     p = sub.add_parser("list", parents=[base]); p.add_argument('-n', '--limit', type=int); p.add_argument('--offset', type=int, default=0)
     p = sub.add_parser("read", parents=[base]); p.add_argument("contact"); p.add_argument("-n", "--limit", type=int, default=50); p.add_argument("-d", "--days", type=int, default=7)
     p = sub.add_parser("search", parents=[base]); p.add_argument("keyword"); p.add_argument("-d", "--days", type=int, default=30); p.add_argument("-n", "--limit", type=int, default=50)
+    p = sub.add_parser("range", parents=[base]); p.add_argument("contact"); p.add_argument("--start", required=True); p.add_argument("--end", default=""); p.add_argument("-n", "--limit", type=int, default=200); p.add_argument("--offset", type=int, default=0)
+    p = sub.add_parser("search-chat", parents=[base]); p.add_argument("contact"); p.add_argument("keyword"); p.add_argument("--start", default=""); p.add_argument("--end", default=""); p.add_argument("-d", "--days", type=int, default=30); p.add_argument("-n", "--limit", type=int, default=50)
     p = sub.add_parser("recent", parents=[base]); p.add_argument("-d", "--days", type=int, default=3); p.add_argument("-n", "--limit", type=int, default=100)
     p = sub.add_parser("summary", parents=[base]); p.add_argument("-d", "--days", type=int, default=3)
     p = sub.add_parser("events", parents=[base]); p.add_argument("-e", "--event", default=""); p.add_argument("-d", "--days", type=int, default=30); p.add_argument("-n", "--limit", type=int, default=100)
@@ -578,6 +704,10 @@ def main():
             r = list_chats()
     elif a.cmd == "read":
         r = read_chat(a.contact, a.limit, a.days)
+    elif a.cmd == "range":
+        r = read_chat_range(a.contact, a.start, a.end, a.limit, a.offset)
+    elif a.cmd == "search-chat":
+        r = search_chat(a.contact, a.keyword, a.days, a.limit, a.start, a.end)
     elif a.cmd == "search":
         r = search(a.keyword, a.days, a.limit)
     elif a.cmd == "recent":

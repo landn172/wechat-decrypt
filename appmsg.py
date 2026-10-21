@@ -305,8 +305,11 @@ def parse_app_message(content: str | bytes | None, raw_type=0) -> dict:
 
     elif kind == "quote":
         refer = payload.nested_node("refermsg")
-        result["quoted_sender"] = payload.nested_text(
-            refer, "displayname", "chatusr", "fromusr"
+        # In group quotes fromusr is the chatroom itself; chatusr is the member who wrote it.
+        sender_wxid = _first(payload.nested_text(refer, "chatusr"), payload.nested_text(refer, "fromusr"))
+        result["quoted_sender_wxid"] = "" if sender_wxid.endswith("@chatroom") else sender_wxid
+        result["quoted_sender"] = _first(
+            payload.nested_text(refer, "displayname"), result["quoted_sender_wxid"]
         )
         result["quoted_content"] = payload.nested_text(refer, "content")
         result["quoted_type"] = _integer(payload.nested_text(refer, "type"))
